@@ -1,15 +1,21 @@
 package scrapers
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io/ioutil"
 	"math"
 	"math/big"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
 	uniswapcontract "github.com/diadata-org/diadata/internal/pkg/exchange-scrapers/uniswap"
 	"github.com/diadata-org/diadata/pkg/dia"
 	"github.com/diadata-org/diadata/pkg/dia/helpers"
+	"github.com/diadata-org/diadata/pkg/utils"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
@@ -17,6 +23,7 @@ import (
 
 var (
 	exchangeFactoryContractAddress = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
+	reversePairs                   *[]string
 )
 
 const (
@@ -71,8 +78,7 @@ type UniswapScraper struct {
 
 // NewUniswapScraper returns a new UniswapScraper for the given pair
 func NewUniswapScraper(exchange dia.Exchange) *UniswapScraper {
-	log.Infoln("NewUniswapScraper ", exchange.Name)
-
+	log.Info("NewUniswapScraper ", exchange.Name)
 	var wsClient, restClient *ethclient.Client
 	var err error
 
@@ -135,6 +141,13 @@ func NewUniswapScraper(exchange dia.Exchange) *UniswapScraper {
 // runs in a goroutine until s is closed
 func (s *UniswapScraper) mainLoop() {
 
+	// Import tokens which appear as base token and we need a quotation for
+	var err error
+	reversePairs, err = getReverseTokensFromConfig("reverse_tokens")
+	if err != nil {
+		log.Error("error getting tokens for which pairs should be reversed: ", err)
+	}
+
 	// wait for all pairs have added into s.PairScrapers
 	time.Sleep(4 * time.Second)
 	s.run = true
@@ -143,9 +156,11 @@ func (s *UniswapScraper) mainLoop() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	log.Info("Found ", numPairs, " pairs")
+	log.Info("Found ", len(s.pairScrapers), " pairScrapers")
 
 	if len(s.pairScrapers) == 0 {
-		s.error = errors.New("bancor: No pairs to scrap provided")
+		s.error = errors.New("Uniswap: No pairs to scrap provided")
 		log.Error(s.error.Error())
 	}
 	for i := 0; i < numPairs; i++ {
@@ -159,8 +174,15 @@ func (s *UniswapScraper) mainLoop() {
 			continue
 		}
 		if helpers.SymbolIsBlackListed(pair.Token0.Symbol) || helpers.SymbolIsBlackListed(pair.Token1.Symbol) {
-			log.Info("skip pair, symbol is blacklisted")
+			if helpers.SymbolIsBlackListed(pair.Token0.Symbol) {
+				log.Infof("skip pair %s. symbol %s is blacklisted", pair.ForeignName, pair.Token0.Symbol)
+			} else {
+				log.Infof("skip pair %s. symbol %s is blacklisted", pair.ForeignName, pair.Token1.Symbol)
+			}
 			continue
+		}
+		if helpers.AddressIsBlacklisted(pair.Token0.Address) || helpers.AddressIsBlacklisted(pair.Token1.Address) {
+			log.Info("skip pair ", pair.ForeignName, ", address is blacklisted")
 		}
 		pair.normalizeUniPair()
 		ps, ok := s.pairScrapers[pair.ForeignName]
@@ -193,13 +215,21 @@ func (s *UniswapScraper) mainLoop() {
 							ForeignTradeID: swap.ID,
 							Source:         s.exchangeName,
 						}
-						ps.parent.chanTrades <- t
+						// If we need quotation of a base token, reverse pair
+						if utils.Contains(reversePairs, strings.ToLower(pair.Token1.Address.Hex())) {
+							tSwapped, err := dia.SwapTrade(*t)
+							if err == nil {
+								t = &tSwapped
+							}
+						}
 						log.Info("Got trade: ", t)
+						ps.parent.chanTrades <- t
 					}
 				}
 			}()
+		} else {
+			log.Info("Skipping pair due to no pairScraper being available")
 		}
-
 	}
 
 	// s.cleanup(err)
@@ -222,6 +252,42 @@ func (s *UniswapScraper) GetSwapsChannel(pairAddress common.Address) (chan *unis
 
 	return sink, nil
 
+}
+
+// getReverseTokensFromConfig returns a list of addresses from config file.
+func getReverseTokensFromConfig(filename string) (*[]string, error) {
+
+	var reverseTokens []string
+
+	// Load file and read data
+	fileName := fmt.Sprintf("../config/uniswap/%s.json", filename)
+	jsonFile, err := os.Open(fileName)
+	if err != nil {
+		return &[]string{}, err
+	}
+	defer jsonFile.Close()
+	byteData, err := ioutil.ReadAll(jsonFile)
+	if err != nil {
+		return &[]string{}, err
+	}
+
+	// Unmarshal read data
+	type lockedAsset struct {
+		Address string `json:"Address"`
+		Symbol  string `json:"Symbol"`
+	}
+	type lockedAssetList struct {
+		AllAssets []lockedAsset `json:"Tokens"`
+	}
+	var allAssets lockedAssetList
+	json.Unmarshal(byteData, &allAssets)
+
+	// Extract addresses
+	for _, token := range allAssets.AllAssets {
+		reverseTokens = append(reverseTokens, token.Address)
+	}
+
+	return &reverseTokens, nil
 }
 
 // normalizeUniswapSwap takes a swap as returned by the swap contract's channel and converts it to a UniswapSwap type
@@ -325,15 +391,26 @@ func (up *UniswapPair) normalizeUniPair() {
 
 // GetPairByID returns the UniswapPair with the integer id @num
 func (s *UniswapScraper) GetPairByID(num int64) (UniswapPair, error) {
+	log.Info("Get pair ID: ", num)
 	var contract *uniswapcontract.IUniswapV2FactoryCaller
 	contract, err := uniswapcontract.NewIUniswapV2FactoryCaller(common.HexToAddress(exchangeFactoryContractAddress), s.RestClient)
 	if err != nil {
+		log.Error(err)
 		return UniswapPair{}, err
 	}
 	numToken := big.NewInt(num)
 	pairAddress, err := contract.AllPairs(&bind.CallOpts{}, numToken)
+	if err != nil {
+		log.Error(err)
+		return UniswapPair{}, err
+	}
 
-	return s.GetPairByAddress(pairAddress)
+	pair, err := s.GetPairByAddress(pairAddress)
+	if err != nil {
+		log.Error(err)
+		return UniswapPair{}, err
+	}
+	return pair, err
 }
 
 // GetPairByAddress returns the UniswapPair with pair address @pairAddress
